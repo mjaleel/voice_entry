@@ -256,30 +256,70 @@ code, pre, .stCode, input[type=text] {direction: ltr; text-align: left;}
 
 # ───────────────────────── المفاتيح وكلمة السر ─────────────────────────
 
+def _cloud_secret(name):
+    """قيمة من Secrets في Streamlit Cloud (أو .streamlit/secrets.toml محليًا)."""
+    try:
+        v = st.secrets.get(name)
+        return str(v).strip() if v else None
+    except Exception:
+        return None
+
+
 def ensure_keys():
-    os.makedirs(KEYS, exist_ok=True)
-    if not os.path.exists(PRIV):
-        sk = os.urandom(32)
-        with open(PRIV, "w") as f:
-            f.write(sk.hex())
-        with open(PUB, "w") as f:
-            f.write(ed_public_key(sk).hex())
-        return True
-    return False
+    """المفتاح من Secrets إن وُجد (للنشر على الإنترنت)، وإلا من مجلد keys بجانب الملف."""
+    if _cloud_secret("private_key"):
+        return False
+    if os.path.exists(PRIV):
+        return False
+    # لا ننشئ مفاتيح بصمت: مفتاح جديد يعني أن البرامج المبنية سابقًا لن تقبل مفاتيحه
+    st.title("نظام التفعيل")
+    st.error("لا يوجد مفتاح توقيع.")
+    st.markdown(
+        "**على Streamlit Cloud:** افتح على جهازك الملف `keys/private.key` (الذي بُني به البرنامج)، "
+        "وانسخ محتواه. ثم في Streamlit Cloud: **Settings ← Secrets** والصق:")
+    st.code('private_key = "المحتوى هنا"\nadmin_password = "كلمة سر للصفحة"', language="toml")
+    st.markdown("**على جهازك لأول مرة فقط:** شغّل `build.bat` قبل هذه الصفحة، فهو ينشئ المفتاح.")
+    st.stop()
 
 
 def secret():
-    return bytes.fromhex(open(PRIV).read().strip())
+    s = _cloud_secret("private_key") or open(PRIV).read().strip()
+    return bytes.fromhex(s)
 
 
 def public_hex():
-    return open(PUB).read().strip()
+    return ed_public_key(secret()).hex()
+
+
+def require_password():
+    """كلمة السر مطلوبة إذا ضُبط admin_password في Secrets (إلزامي عند النشر على الإنترنت)."""
+    pw = _cloud_secret("admin_password")
+    online = bool(_cloud_secret("private_key"))
+    if online and not pw:
+        st.error("الصفحة منشورة دون كلمة سر. أضف admin_password في Secrets.")
+        st.stop()
+    if not pw or st.session_state.get("auth"):
+        return
+    st.title("نظام التفعيل")
+    typed = st.text_input("كلمة السر", type="password")
+    if st.button("دخول", type="primary"):
+        if hmac.compare_digest(typed.encode(), pw.encode()):
+            st.session_state.auth = True
+            st.rerun()
+        st.error("كلمة السر غير صحيحة.")
+    st.stop()
 
 
 # ───────────────────────── قاعدة البيانات ─────────────────────────
 
 def db():
-    c = sqlite3.connect(DB)
+    path = DB
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), "licenses.db")
+    c = sqlite3.connect(path)
     c.execute("""CREATE TABLE IF NOT EXISTS licenses(
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, customer TEXT, contact TEXT,
         request_code TEXT, plan TEXT, issued TEXT, expiry TEXT, license_key TEXT, notes TEXT)""")
@@ -375,12 +415,15 @@ def page_log():
 
 def page_keys(new):
     st.subheader("المفاتيح")
+    if _cloud_secret("private_key"):
+        st.info("على Streamlit Cloud يُمسح السجل عند إعادة تشغيل التطبيق. انسخ كل مفتاح تصدره، أو نزّل السجل CSV دوريًا.")
     st.write("المفتاح الخاص في مجلد keys هو ما يُصدر مفاتيح التفعيل. خذ نسخة من مجلد keys في فلاشة.")
     st.code(public_hex(), language=None)
 
 
 def main():
     new = ensure_keys()
+    require_password()
     st.title("نظام التفعيل")
     st.markdown(f'<span class="muted">رقم النسخة: <b dir="ltr">{public_hex()[:8].upper()}</b> — يجب أن يطابق الرقم '
                 f'في نافذة تفعيل البرنامج. إن اختلف: شغّل build.bat من هذا المجلد ووزّع الملف الجديد.</span>',
