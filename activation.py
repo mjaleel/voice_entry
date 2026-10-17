@@ -1,6 +1,7 @@
+
 # -*- coding: utf-8 -*-
 """
-نظام التفعيل — ملف واحد. لا يحتاج إلا streamlit.
+نظام التفعيل الموحّد — ملف واحد لكل برامجك (الرواتب القديم والجديد، والإدخال الصوتي). لا يحتاج إلا streamlit.
 التشغيل:  streamlit run activation.py --server.address 127.0.0.1
 المفاتيح تُحفظ في مجلد keys بجانب هذا الملف (هو نفسه الذي يستخدمه build.bat).
 """
@@ -24,6 +25,7 @@ import streamlit as st
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEYS = os.path.join(HERE, "keys")          # نفس مجلد keys الذي يستخدمه build.bat
 DB = os.path.join(KEYS, "licenses.db")
+OLD_SECRET_FILE = os.path.join(KEYS, "old_secret.txt")
 PRIV = os.path.join(KEYS, "private.key")
 PUB = os.path.join(KEYS, "public.key")
 
@@ -155,7 +157,14 @@ def ed_verify(public: bytes, msg: bytes, signature: bytes) -> bool:
 
 
 # ═════════════════ صيغة مفتاح التفعيل (مطابقة لـ license_format.py في البرنامج) ═════════════════
-PRODUCT = b"MJ-VOICE-ENTRY-v1"
+# البرامج التي تصدر لها هذه الصفحة مفاتيح. اسم المنتج داخل التوقيع: مفتاح برنامج لا يعمل على آخر.
+PRODUCTS = {
+    "payroll2": {"label": "أداة الرواتب — الإصدار الجديد", "id": b"MJ-PAYROLL-v2", "features": True},
+    "voice": {"label": "برنامج الإدخال الصوتي المستقل", "id": b"MJ-VOICE-ENTRY-v1", "features": False},
+    "payroll1": {"label": "أداة الرواتب — الإصدار القديم", "id": None, "features": False},
+}
+FEATURES = {"voice": (1, "الإدخال الصوتي")}
+PRODUCT = PRODUCTS["voice"]["id"]
 EPOCH = datetime.date(2024, 1, 1)
 NEVER = 0xFFFF
 VERSION = 1
@@ -196,16 +205,32 @@ def parse_request_code(code: str) -> bytes:
 
 
 def make_license(secret: bytes, machine: bytes, issued: datetime.date,
-                 expiry: "datetime.date | None", plan: int = 4) -> str:
+                 expiry: "datetime.date | None", plan: int = 4, product: bytes = PRODUCT) -> str:
     exp = NEVER if expiry is None else day_num(expiry)
     payload = struct.pack(">B10sHHB", VERSION, machine, day_num(issued), exp, plan)
-    sig = ed_sign(secret, PRODUCT + payload)
+    sig = ed_sign(secret, product + payload)
     return group(_b32(payload + sig), 8)
 
 
 def ar_date(d: datetime.date) -> str:
     """تاريخ للعرض داخل نص عربي: الشرطة المائلة تبقي الأرقام متماسكة في اتجاه الكتابة."""
     return f"{d.year}/{d.month:02d}/{d.day:02d}"
+
+
+# ═════════════════ الإصدار القديم (HMAC) — نفس خوارزمية البرنامج القديم حرفيًا ═════════════════
+
+def old_make_key(secret: str, machine_id: str, days: int = 0) -> str:
+    mid = re.sub(r"[^A-F0-9]", "", (machine_id or "").upper())[:16]
+    if len(mid) < 8:
+        raise ValueError("معرف الجهاز غير صالح (16 حرفًا من 0-9 و A-F)")
+    exp = (dt.datetime.now() + dt.timedelta(days=int(days))).strftime("%Y%m%d") if days and int(days) > 0 else "0"
+    sig = hmac.new(secret.encode("utf-8"), f"{mid}:{exp}".encode("utf-8"), hashlib.sha256).hexdigest()[:16].upper()
+    return f"{mid}-{exp}-{sig}"
+
+
+def old_secret():
+    return _cloud_secret("old_secret") or (open(OLD_SECRET_FILE, encoding="utf-8").read().strip()
+                                           if os.path.exists(OLD_SECRET_FILE) else None)
 
 
 class License:
@@ -222,7 +247,7 @@ class License:
         return f"صالح حتى {ar_date(self.expiry)}"
 
 
-def read_license(public: bytes, key: str) -> License:
+def read_license(public: bytes, key: str, product: bytes = PRODUCT) -> License:
     """Raises ValueError with an Arabic message if the key is not genuine."""
     try:
         raw = _unb32(key)
@@ -231,7 +256,7 @@ def read_license(public: bytes, key: str) -> License:
     if len(raw) != 80:
         raise ValueError("مفتاح التفعيل ناقص أو زائد — انسخه كاملًا")
     payload, sig = raw[:16], raw[16:]
-    if not ed_verify(public, PRODUCT + payload, sig):
+    if not ed_verify(public, product + payload, sig):
         raise ValueError("مفتاح التفعيل غير صالح")
     ver, machine, issued, exp, plan = struct.unpack(">B10sHHB", payload)
     if ver != VERSION:
@@ -323,19 +348,24 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS licenses(
         id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, customer TEXT, contact TEXT,
         request_code TEXT, plan TEXT, issued TEXT, expiry TEXT, license_key TEXT, notes TEXT)""")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(licenses)")]
+    if "product" not in cols:
+        c.execute("ALTER TABLE licenses ADD COLUMN product TEXT DEFAULT 'voice'")
+    if "features" not in cols:
+        c.execute("ALTER TABLE licenses ADD COLUMN features TEXT DEFAULT ''")
     return c
 
 
-def save(row):
+def save(row, product="voice", features=""):
     with db() as c:
-        c.execute("INSERT INTO licenses(created,customer,contact,request_code,plan,issued,expiry,license_key,notes)"
-                  " VALUES(?,?,?,?,?,?,?,?,?)", row)
+        c.execute("INSERT INTO licenses(created,customer,contact,request_code,plan,issued,expiry,license_key,notes,"
+                  "product,features) VALUES(?,?,?,?,?,?,?,?,?,?,?)", tuple(row) + (product, features))
 
 
 def rows():
     with db() as c:
-        return c.execute("SELECT id,created,customer,contact,request_code,plan,issued,expiry,license_key,notes "
-                         "FROM licenses ORDER BY id DESC").fetchall()
+        return c.execute("SELECT id,created,customer,contact,request_code,plan,issued,expiry,license_key,notes,"
+                         "product,features FROM licenses ORDER BY id DESC").fetchall()
 
 
 # ───────────────────────── الصفحات ─────────────────────────
@@ -349,32 +379,67 @@ PLANS = {
 def page_issue():
     st.subheader("إصدار مفتاح")
     prefill = st.session_state.pop("prefill", {})
+    keys = list(PRODUCTS)
+    prod = st.radio("البرنامج", keys, format_func=lambda k: PRODUCTS[k]["label"], horizontal=True,
+                    index=keys.index(prefill.get("product", "payroll2")), key="prod")
+    P_ = PRODUCTS[prod]
+    old = P_["id"] is None
+    if old and not old_secret():
+        st.warning("لإصدار مفاتيح الإصدار القديم أضف سره: في Secrets سطر old_secret = \"...\" "
+                   "أو ملف keys/old_secret.txt. السر هو قيمة LICENSE_SECRET في البرنامج القديم.")
+        return
     with st.form("issue", clear_on_submit=False):
-        code = st.text_input("رمز الطلب من جهاز العميل", value=prefill.get("code", ""), placeholder="XXXX-XXXX-XXXX-XXXX")
+        code = st.text_input("معرف الجهاز (Hard ID — 16 حرفًا)" if old else "رمز الطلب من جهاز العميل",
+                             value=prefill.get("code", ""),
+                             placeholder="XXXXXXXXXXXXXXXX" if old else "XXXX-XXXX-XXXX-XXXX")
         c1, c2 = st.columns(2)
         customer = c1.text_input("اسم العميل", value=prefill.get("customer", ""))
         contact = c2.text_input("هاتف أو جهة", value=prefill.get("contact", ""))
+        feats = []
+        if P_["features"]:
+            st.markdown("**الصلاحيات**")
+            for fk, (bit, lbl) in FEATURES.items():
+                if st.checkbox(lbl, value=fk in prefill.get("features", ""), key=f"f_{fk}"):
+                    feats.append(fk)
         plan = st.radio("المدة", list(PLANS), horizontal=True, index=4)
         c3, c4 = st.columns(2)
-        start = c3.date_input("يبدأ من", value=dt.date.today())
+        start = c3.date_input("يبدأ من", value=dt.date.today(), disabled=old)
         until = c4.date_input("ينتهي في (للمدة المحددة فقط)", value=dt.date.today() + dt.timedelta(days=365))
         notes = st.text_input("ملاحظات")
         go = st.form_submit_button("أصدر المفتاح", type="primary")
     if not go:
         return
-    try:
-        machine = parse_request_code(code)
-    except Exception as e:
-        st.error(str(e) or "رمز الطلب غير صحيح."); return
     pid, days = PLANS[plan]
-    expiry = None if days is None else (until if days == "custom" else start + dt.timedelta(days=days))
-    if expiry is not None and expiry < start:
-        st.error("تاريخ الانتهاء قبل تاريخ البدء."); return
-    key = make_license(secret(), machine, start, expiry, pid)
-    lic = read_license(bytes.fromhex(public_hex()), key)          # تحقق ذاتي قبل الحفظ
-    save((dt.datetime.now().isoformat(timespec="seconds"), customer, contact, request_code(machine),
-          plan, start.isoformat(), expiry.isoformat() if expiry else "", key, notes))
-    st.markdown(f'<span class="stamp">صدر</span> &nbsp; <span class="muted">{lic.describe()}</span>',
+    today = dt.date.today()
+    if old:
+        if days == "custom":
+            days = max(1, (until - today).days)
+        try:
+            key = old_make_key(old_secret(), code, 0 if days is None else days)
+        except ValueError as e:
+            st.error(str(e)); return
+        exp = key.split("-")[1]
+        desc = "دائم" if exp == "0" else f"حتى {exp[:4]}/{exp[4:6]}/{exp[6:]}"
+        save((dt.datetime.now().isoformat(timespec="seconds"), customer, contact, key.split("-")[0],
+              plan, today.isoformat(), "" if exp == "0" else f"{exp[:4]}-{exp[4:6]}-{exp[6:]}", key, notes), prod)
+    else:
+        try:
+            machine = parse_request_code(code)
+        except Exception as e:
+            st.error(str(e) or "رمز الطلب غير صحيح."); return
+        expiry = None if days is None else (until if days == "custom" else start + dt.timedelta(days=days))
+        if expiry is not None and expiry < start:
+            st.error("تاريخ الانتهاء قبل تاريخ البدء."); return
+        flags = sum(FEATURES[f][0] for f in feats) if P_["features"] else pid
+        key = make_license(secret(), machine, start, expiry, flags, P_["id"])
+        lic = read_license(bytes.fromhex(public_hex()), key, P_["id"])          # تحقق ذاتي قبل الحفظ
+        desc = lic.describe()
+        if P_["features"]:
+            desc = ("دائم" if lic.perpetual else f"حتى {ar_date(lic.expiry)}") + \
+                   (" — " + "، ".join(FEATURES[f][1] for f in feats) if feats else " — أساسي (دون صوت)")
+        save((dt.datetime.now().isoformat(timespec="seconds"), customer, contact, request_code(machine),
+              plan, start.isoformat(), expiry.isoformat() if expiry else "", key, notes), prod, ",".join(feats))
+    st.markdown(f'<span class="stamp">صدر</span> &nbsp; <span class="muted">{P_["label"]} · {desc}</span>',
                 unsafe_allow_html=True)
     st.code(key, language=None)
     st.caption("انسخ المفتاح بالزر في زاوية المربع وأرسله للعميل. يُلصق في نافذة «تفعيل البرنامج».")
@@ -395,20 +460,23 @@ def page_log():
     q = st.text_input("بحث باسم العميل أو رمز الطلب").strip().lower()
     view = [r for r in data if not q or q in (r[2] or "").lower() or q in (r[4] or "").lower() or q in (r[3] or "").lower()]
     st.dataframe(
-        [{"#": r[0], "العميل": r[2], "الجهة": r[3], "رمز الطلب": r[4], "المدة": r[5],
-          "من": r[6], "إلى": r[7] or "—", "الحالة": status(r[7])} for r in view],
+        [{"#": r[0], "البرنامج": PRODUCTS.get(r[10] or "voice", {}).get("label", r[10]),
+          "العميل": r[2], "الجهة": r[3], "رمز الطلب": r[4], "الصلاحيات": (r[11] or "").replace("voice", "صوت") or "—",
+          "المدة": r[5], "من": r[6], "إلى": r[7] or "—", "الحالة": status(r[7])} for r in view],
         hide_index=True, width="stretch")
     ids = [r[0] for r in view]
     pick = st.selectbox("عرض مفتاح أو تجديده", ids, format_func=lambda i: next(f"#{r[0]}  {r[2] or ''}  {r[4]}" for r in view if r[0] == i))
     r = next(r for r in view if r[0] == pick)
     st.code(r[8], language=None)
     if st.button("تجديد لنفس الجهاز"):
-        st.session_state.prefill = {"code": r[4], "customer": r[2], "contact": r[3]}
+        st.session_state.prefill = {"code": r[4], "customer": r[2], "contact": r[3],
+                                    "product": r[10] or "voice", "features": r[11] or ""}
         st.session_state.goto = "إصدار مفتاح"
         st.rerun()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["id", "created", "customer", "contact", "request_code", "plan", "issued", "expiry", "license_key", "notes"])
+    w.writerow(["id", "created", "customer", "contact", "request_code", "plan", "issued", "expiry", "license_key", "notes",
+                "product", "features"])
     w.writerows(data)
     st.download_button("تنزيل السجل CSV", buf.getvalue().encode("utf-8-sig"), "licenses.csv", "text/csv")
 
@@ -419,6 +487,7 @@ def page_keys(new):
         st.info("على Streamlit Cloud يُمسح السجل عند إعادة تشغيل التطبيق. انسخ كل مفتاح تصدره، أو نزّل السجل CSV دوريًا.")
     st.write("المفتاح الخاص في مجلد keys هو ما يُصدر مفاتيح التفعيل. خذ نسخة من مجلد keys في فلاشة.")
     st.code(public_hex(), language=None)
+    st.caption("هذا المفتاح العام يطلبه build_exe.bat عند بناء أداة الرواتب الجديدة. الصقه هناك.")
 
 
 def main():
@@ -426,7 +495,7 @@ def main():
     require_password()
     st.title("نظام التفعيل")
     st.markdown(f'<span class="muted">رقم النسخة: <b dir="ltr">{public_hex()[:8].upper()}</b> — يجب أن يطابق الرقم '
-                f'في نافذة تفعيل البرنامج. إن اختلف: شغّل build.bat من هذا المجلد ووزّع الملف الجديد.</span>',
+                f'في نافذة تفعيل البرنامج الجديد. إن اختلف: أعد البناء بالمفتاح العام من قسم «المفاتيح».</span>',
                 unsafe_allow_html=True)
     tabs = ["إصدار مفتاح", "السجل", "المفاتيح"]
     if "goto" in st.session_state:
